@@ -4,6 +4,8 @@
 
 This is the official code to reproduce the experiments in the paper [AnomalyDINO: Boosting Patch-based Few-shot Anomaly Detection with DINOv2](https://arxiv.org/abs/2405.14529), accepted at IEEE/CVF Winter Conference on Applications of Computer Vision (WACV 2025).
 
+> **Fork note:** This repository is a fork of [dammsi/AnomalyDINO](https://github.com/dammsi/AnomalyDINO) that adds an opt-in **FastRef** reference-refinement implementation (AnomalyDINO+). See [FastRef (AnomalyDINO+)](#fastref-anomalydino). All original code and credit belong to the AnomalyDINO authors.
+
 ## Updates
 - **Nov 2026:** [DINOv3](https://github.com/facebookresearch/dinov3) backbones included (`--model_name dinov3_vits16`, also in the batched zero-shot script). With the default settings, DINOv2 seems to stay the better choice, see the [comparison below](#dinov2-vs-dinov3).
 
@@ -69,6 +71,36 @@ Evaluation results are saved in the respective results directory as `metrics_see
 Other backbones can be selected with `--model_name`, e.g., `dinov2_vitb14` or DINOv3 (`dinov3_vits16`, `dinov3_vitb16`, `dinov3_vitl16`, ...; loaded via `timm`). 
 Note that zero-shot masking is only supported for DINOv2, for all other backbones masking is deactivated.
 By default, patch features are taken from the last transformer block (as in the paper), other layers can be selected with `--layer`.
+
+### FastRef (AnomalyDINO+)
+
+This fork adds an opt-in implementation of **FastRef** reference refinement (CVPR 2026) on top of AnomalyDINO (`src/fastref.py`).
+FastRef refines the few-shot reference patch bank with closed-form updates and an entropic optimal-transport (Sinkhorn) alignment to the test features, and scores test patches by reconstruction error (or nearest-neighbor distance).
+Without `--use_fastref`, behavior is identical to the original AnomalyDINO; FastRef runs are written to a separate `*_fastref` results directory.
+
+```shell
+python run_anomalydino.py --dataset MVTec --data_root data/mvtec_anomaly_detection \
+    --shots 1 2 4 --num_seeds 3 --preprocess force_no_mask_no_rotation --eval_segm \
+    --use_fastref --fastref_alpha 0.5 --fastref_lambda 0.1 --fastref_iters 2 \
+    --fastref_ot_iters 10 --fastref_ot_eps 0.1
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--use_fastref` | off | Enable FastRef refinement |
+| `--fastref_alpha` | 0.5 | Update step size, in (0, 1] |
+| `--fastref_lambda` | 0.1 | Regularization weight (>= 0) |
+| `--fastref_iters` | 2 | Number of refinement iterations |
+| `--fastref_ot_iters` / `--fastref_ot_eps` | 10 / 0.1 | Sinkhorn iterations / entropic regularization |
+| `--fastref_score_mode` | `reconstruction` | `reconstruction` or `nn` |
+| `--fastref_ot_scale` | `row_normalized` | `row_normalized` or `unscaled` transport plan |
+| `--fastref_coreset_mode` | `greedy_kcenter` | `greedy_kcenter`, `approx_kcenter` or `random` |
+
+Full baseline-vs-FastRef reproduction on MVTec-AD (1/2/4-shot, 3 seeds) with a summary table:
+```shell
+DATA_ROOT=data/mvtec_anomaly_detection bash scripts/reproduce_fastref_mvtec.sh
+```
+Hyperparameters and ablations (e.g. `SCORE_MODE=nn`, `OT_SCALE=unscaled`, `PREPROCESS=agnostic`) are set via environment variables; see the script header.
 
 ### Tests
 Some quick sanity checks (no datasets, model downloads or GPU required) can be run with `pytest tests` (`pytest` is included in `requirements.txt`).
