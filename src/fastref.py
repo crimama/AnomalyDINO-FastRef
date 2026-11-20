@@ -128,3 +128,146 @@ def sinkhorn_transport(
         v = log_b - torch.logsumexp(log_k + u.unsqueeze(1), dim=0)
 
     return torch.exp(u.unsqueeze(1) + v.unsqueeze(0) + log_k)
+
+
+def _l2_normalize(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """L2-normalize rows of a 2D tensor with a lower norm clamp for zero-vector safety."""
+    norms = torch.linalg.norm(x, dim=1, keepdim=True).clamp(min=eps)
+    return x / norms
+
+
+def _pairwise_cost(x: torch.Tensor, y: torch.Tensor, metric: str) -> torch.Tensor:
+    """Compute pairwise non-negative cosine or squared-Euclidean cost between 2D tensors."""
+    if metric == "cosine":
+        x_norm = _l2_normalize(x)
+        y_norm = _l2_normalize(y)
+        return (0.5 * (1.0 - x_norm @ y_norm.T)).clamp(0.0, 1.0)
+    if metric == "euclidean":
+        return torch.cdist(x, y, p=2).pow(2)
+    raise ValueError(f"Unsupported metric: {metric!r}")
+
+
+class FastRefRefiner:
+    """Closed-form test-time prototype refiner using Sinkhorn OT alignment."""
+
+    def __init__(self, config: FastRefConfig, device: str | torch.device = "cpu") -> None:
+        self.config = config
+        self.device = torch.device(device)
+        self.M_s: torch.Tensor | None = None
+        self.M_pinv: torch.Tensor | None = None
+        self.P_proj: torch.Tensor | None = None
+
+    def _require_fitted(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.M_s is None or self.M_pinv is None or self.P_proj is None:
+            raise RuntimeError("FastRefRefiner must be fitted before calling refine/score.")
+        return self.M_s, self.M_pinv, self.P_proj
+
+    def _prepare_query(self, query_features: np.ndarray | torch.Tensor, c: int) -> torch.Tensor:
+        if isinstance(query_features, torch.Tensor):
+            f_q = query_features.detach().to(device=self.device, dtype=torch.float64)
+        else:
+            f_q = torch.as_tensor(np.asarray(query_features), dtype=torch.float64, device=self.device)
+        if f_q.ndim != 2 or f_q.shape[1] != c:
+            raise ValueError(
+                f"query_features must be a 2D array with {c} columns, got shape {tuple(f_q.shape)}"
+            )
+        if self.config.metric == "cosine" and f_q.shape[0] > 0:
+            f_q = _l2_normalize(f_q)
+        return f_q
+
+    def fit(self, support_features: np.ndarray | torch.Tensor) -> "FastRefRefiner":
+        """Build coreset prototypes and precompute closed-form projection operators."""
+        if isinstance(support_features, torch.Tensor):
+            sup_np = support_features.detach().cpu().numpy()
+        else:
+            sup_np = np.asarray(support_features)
+
+        if sup_np.ndim != 2 or sup_np.shape[0] == 0 or sup_np.shape[1] == 0:
+            raise ValueError(
+                f"support_features must be a non-empty 2D array, got shape {sup_np.shape}"
+            )
+
+        sup_work = sup_np.astype(np.float64, copy=True)
+        if self.config.metric == "cosine":
+            norms = np.maximum(np.linalg.norm(sup_work, axis=1, keepdims=True), 1e-12)
+            sup_work = sup_work / norms
+
+        prototypes = coreset_subsample(
+            sup_work,
+            ratio=self.config.alpha,
+            mode=self.config.coreset_mode,
+            seed=self.config.seed,
+        )
+
+        m_s = torch.as_tensor(prototypes, dtype=torch.float64, device=self.device)
+        gram = m_s @ m_s.T
+        if self.config.ridge == 0.0:
+            gram_inv = torch.linalg.pinv(gram, hermitian=True)
+        else:
+            eye = torch.eye(gram.shape[0], dtype=torch.float64, device=self.device)
+            gram_inv = torch.linalg.inv(gram + self.config.ridge * eye)
+
+        self.M_s = m_s
+        self.M_pinv = m_s.T @ gram_inv
+        self.P_proj = gram @ gram_inv
+        return self
+
+    def _refine_prepared(
+        self, f_q: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        m_s, m_pinv, p_proj = self._require_fitted()
+        m = f_q.shape[0]
+        n, c = m_s.shape
+        if m == 0:
+            return (
+                torch.zeros((0, c), dtype=torch.float64, device=self.device),
+                torch.zeros((0, n), dtype=torch.float64, device=self.device),
+                None,
+            )
+
+        w_0 = f_q @ m_pinv
+        if self.config.lam == 0.0 or self.config.num_iters == 0:
+            return w_0 @ m_s, w_0, None
+
+        w = w_0
+        t_plan: torch.Tensor | None = None
+        for _ in range(self.config.num_iters):
+            m_w = w @ m_s
+            cost = _pairwise_cost(m_w, m_s, self.config.metric)
+            t_plan = sinkhorn_transport(
+                cost, eps=self.config.sinkhorn_eps, num_iters=self.config.sinkhorn_iters
+            )
+            t_eff = (m * t_plan) if self.config.ot_scale == "row_normalized" else t_plan
+            denom = 1.0 + self.config.lam * t_eff.sum(dim=1, keepdim=True)
+            w = (w_0 + self.config.lam * (t_eff @ p_proj)) / denom
+
+        return w @ m_s, w, t_plan
+
+    def refine(
+        self, query_features: np.ndarray | torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Iteratively refine prototypes for a single query image's patch features."""
+        m_s, _, _ = self._require_fitted()
+        f_q = self._prepare_query(query_features, m_s.shape[1])
+        return self._refine_prepared(f_q)
+
+    def score(self, query_features: np.ndarray | torch.Tensor) -> np.ndarray:
+        """Compute per-patch anomaly scores (1D float32 array) for query features."""
+        m_s, _, _ = self._require_fitted()
+        f_q = self._prepare_query(query_features, m_s.shape[1])
+        if f_q.shape[0] == 0:
+            return np.zeros((0,), dtype=np.float32)
+
+        refined, _, _ = self._refine_prepared(f_q)
+        if self.config.score_mode == "reconstruction":
+            if self.config.metric == "cosine":
+                refined_norm = _l2_normalize(refined)
+                scores = (0.5 * (1.0 - (f_q * refined_norm).sum(dim=1))).clamp(0.0, 1.0)
+            else:
+                scores = ((f_q - refined) ** 2).sum(dim=1)
+        elif self.config.score_mode == "nn":
+            scores = _pairwise_cost(f_q, refined, self.config.metric).min(dim=1).values
+        else:
+            raise ValueError(f"Unsupported score_mode: {self.config.score_mode!r}")
+
+        return scores.detach().cpu().numpy().astype(np.float32)
