@@ -7,6 +7,7 @@ from tqdm import trange
 
 from src.utils import get_dataset_info, list_images, limit_cpu_threads, PREPROCESS_OPTIONS
 from src.detection import run_anomaly_detection
+from src.fastref import FastRefConfig
 from src.post_eval import eval_finished_run
 from src.visualize import create_sample_plots
 from src.backbones import get_model
@@ -52,9 +53,68 @@ def parse_args():
     parser.add_argument("--warmup_iters", type=int, default=25, help="Number of warmup iterations, relevant when benchmarking inference time.")
 
     parser.add_argument("--tag", help="Optional tag for the saving directory.")
+    parser.add_argument("--use_fastref", default=False, action=argparse.BooleanOptionalAction,
+                        help="Enable FastRef prototype refinement instead of raw FAISS kNN search.")
+    parser.add_argument("--fastref_alpha", type=float, default=0.5,
+                        help="FastRef coreset subsampling ratio in (0, 1].")
+    parser.add_argument("--fastref_lambda", type=float, default=0.1,
+                        help="FastRef optimal transport regularization weight.")
+    parser.add_argument("--fastref_iters", type=int, default=2,
+                        help="Number of FastRef alternating optimization iterations.")
+    parser.add_argument("--fastref_ot_iters", type=int, default=10,
+                        help="Number of Sinkhorn iterations for FastRef optimal transport.")
+    parser.add_argument("--fastref_ot_eps", type=float, default=0.1,
+                        help="Sinkhorn entropic regularization epsilon for FastRef.")
+    parser.add_argument("--fastref_score_mode", type=str, default="reconstruction",
+                        choices=["reconstruction", "nn"],
+                        help="FastRef patch anomaly scoring mode.")
+    parser.add_argument("--fastref_ot_scale", type=str, default="row_normalized",
+                        choices=["row_normalized", "unscaled"],
+                        help="FastRef transport plan scaling mode.")
+    parser.add_argument("--fastref_coreset_mode", type=str, default="greedy_kcenter",
+                        choices=["greedy_kcenter", "approx_kcenter", "random"],
+                        help="FastRef coreset initialization mode.")
+    parser.add_argument("--fastref_ridge", type=float, default=0.0,
+                        help="FastRef ridge regularization for least-squares reconstruction.")
 
     args = parser.parse_args()
     return args
+
+
+def resolve_device(device_arg: str) -> str:
+    """Resolve CLI --device argument into a PyTorch device string ('cpu' or 'cuda')."""
+    return "cpu" if device_arg == "cpu" else "cuda"
+
+
+def build_fastref_config(args, seed: int = 0) -> FastRefConfig:
+    """Build a FastRefConfig synchronized with CLI knn_metric and FastRef flags."""
+    metric = "cosine" if args.knn_metric == "L2_normalized" else "euclidean"
+    return FastRefConfig(
+        alpha=args.fastref_alpha,
+        lam=args.fastref_lambda,
+        num_iters=args.fastref_iters,
+        sinkhorn_iters=args.fastref_ot_iters,
+        sinkhorn_eps=args.fastref_ot_eps,
+        metric=metric,
+        score_mode=args.fastref_score_mode,
+        ot_scale=args.fastref_ot_scale,
+        coreset_mode=args.fastref_coreset_mode,
+        ridge=args.fastref_ridge,
+        seed=seed,
+    )
+
+
+def build_results_dir(args, shot: int) -> str:
+    """Build output directory path, isolating FastRef runs with a '_fastref' suffix."""
+    model_dir = f"{args.model_name}_{args.resolution}" + (
+        f"_layer{'+'.join(map(str, args.layer))}" if args.layer is not None else ""
+    )
+    results_dir = f"results_{args.dataset}/{model_dir}/{shot}-shot_preprocess={args.preprocess}"
+    if args.use_fastref:
+        results_dir += "_fastref"
+    if args.tag is not None:
+        results_dir += "_" + args.tag
+    return results_dir
 
 
 if __name__=="__main__":
@@ -70,10 +130,11 @@ if __name__=="__main__":
 
     objects, object_anomalies, masking_default, rotation_default = get_dataset_info(args.dataset, args.preprocess, data_path=args.data_root)
 
+    device = resolve_device(args.device)
     # set CUDA device (e.g., 'cuda:1' -> only GPU 1 is visible, then addressed as 'cuda')
-    if args.device.startswith("cuda:"):
+    if device == "cuda" and args.device.startswith("cuda:"):
         os.environ["CUDA_VISIBLE_DEVICES"] = args.device.split(":")[1]
-    model = get_model(args.model_name, 'cuda', smaller_edge_size=args.resolution, layers=args.layer)
+    model = get_model(args.model_name, device, smaller_edge_size=args.resolution, layers=args.layer)
 
     if not args.model_name.startswith("dinov2"):
         masking_default = {o: False for o in objects}
@@ -87,11 +148,7 @@ if __name__=="__main__":
     for shot in list(args.shots):
         save_examples = args.save_examples
 
-        model_dir = f"{args.model_name}_{args.resolution}" + (f"_layer{'+'.join(map(str, args.layer))}" if args.layer is not None else "")
-        results_dir = f"results_{args.dataset}/{model_dir}/{shot}-shot_preprocess={args.preprocess}"
-        
-        if args.tag is not None:
-            results_dir += "_" + args.tag
+        results_dir = build_results_dir(args, shot)
         plots_dir = results_dir
         os.makedirs(f"{results_dir}", exist_ok=True)
         
@@ -133,6 +190,7 @@ if __name__=="__main__":
                             for _ in trange(args.warmup_iters, desc="CUDA warmup", leave=False):
                                 model.extract_features(img_tensor)
                                          
+                        fastref_config = build_fastref_config(args, seed=seed) if args.use_fastref else None
                         anomaly_scores, time_memorybank, time_inference = run_anomaly_detection(
                                                                                 model,
                                                                                 object_name,
@@ -149,7 +207,9 @@ if __name__=="__main__":
                                                                                 rotation = rotation_default[object_name],
                                                                                 seed = seed,
                                                                                 save_patch_dists = args.eval_clf, # save patch distances for detection evaluation
-                                                                                save_tiffs = args.eval_segm)      # save anomaly maps as tiffs for segmentation evaluation
+                                                                                save_tiffs = args.eval_segm,      # save anomaly maps as tiffs for segmentation evaluation
+                                                                                use_fastref = args.use_fastref,
+                                                                                fastref_config = fastref_config)
                         
                         # write anomaly scores and inference times to file
                         for sample, anomaly_score in anomaly_scores.items():
