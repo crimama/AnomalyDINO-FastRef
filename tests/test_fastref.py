@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import pytest
 import torch
@@ -298,3 +300,93 @@ def test_refiner_accepts_torch_tensors_and_rejects_invalid_shapes():
         refiner.refine(np.ones((2, 5), dtype=np.float32))
     with pytest.raises(ValueError):
         refiner.score(np.ones((4,), dtype=np.float32))
+
+
+@pytest.mark.parametrize("field", ["alpha", "lam", "sinkhorn_eps", "ridge"])
+@pytest.mark.parametrize("bad_val", [float("nan"), float("inf"), float("-inf")])
+def test_config_rejects_non_finite_values(field, bad_val):
+    with pytest.raises(ValueError):
+        FastRefConfig(**{field: bad_val})
+
+
+@pytest.mark.parametrize("bad_eps", [float("nan"), float("inf"), float("-inf")])
+def test_sinkhorn_rejects_non_finite_eps(bad_eps):
+    with pytest.raises(ValueError):
+        sinkhorn_transport(torch.zeros((3, 3)), eps=bad_eps, num_iters=10)
+
+
+def _reference_greedy_kcenter(features: np.ndarray, ratio: float, seed: int) -> np.ndarray:
+    n_total = features.shape[0]
+    n_select = max(1, min(n_total, int(round(ratio * n_total))))
+    work = features.astype(np.float64, copy=False)
+    rng = np.random.default_rng(seed)
+    start = int(rng.integers(0, n_total))
+    selected = [start]
+    selected_set = {start}
+    for _ in range(1, n_select):
+        best_idx = -1
+        best_dist = -1.0
+        for i in range(n_total):
+            if i in selected_set:
+                continue
+            d = min(float(np.sum((work[i] - work[s]) ** 2)) for s in selected)
+            if d > best_dist:
+                best_dist = d
+                best_idx = i
+        selected.append(best_idx)
+        selected_set.add(best_idx)
+    return features[selected]
+
+
+@pytest.mark.parametrize("seed", [0, 1, 5])
+def test_coreset_greedy_kcenter_matches_exact_bruteforce(seed):
+    rng = np.random.default_rng(seed + 100)
+    feats = rng.normal(size=(60, 16)).astype(np.float32)
+    out = coreset_subsample(feats, ratio=0.35, mode="greedy_kcenter", seed=seed)
+    expected = _reference_greedy_kcenter(feats, ratio=0.35, seed=seed)
+    np.testing.assert_array_equal(out, expected)
+    assert not np.shares_memory(out, feats)
+
+
+def test_coreset_greedy_kcenter_handles_duplicates_without_reselection(monkeypatch):
+    # All identical rows: must select n_select times without repeating indices
+    ident = np.ones((12, 6), dtype=np.float32) * 5.0
+    chosen_indices = []
+    orig_argmax = np.argmax
+
+    def spy_argmax(arr, *args, **kwargs):
+        idx = int(orig_argmax(arr, *args, **kwargs))
+        chosen_indices.append(idx)
+        return idx
+
+    monkeypatch.setattr(np, "argmax", spy_argmax)
+    out_ident = coreset_subsample(ident, ratio=0.5, mode="greedy_kcenter", seed=0)
+    assert out_ident.shape == (6, 6)
+    assert np.isfinite(out_ident).all()
+    assert len(chosen_indices) == 5  # n_select - 1 loop iterations
+    assert len(set(chosen_indices)) == 5
+    start_idx = int(np.random.default_rng(0).integers(0, len(ident)))
+    assert start_idx not in chosen_indices
+
+    # Large-magnitude duplicates + small-offset distinct rows: cancellation must not beat -1.0 sentinel
+    chosen_indices.clear()
+    base = np.array([1e8, 0.0, 0.0, 0.0], dtype=np.float64)
+    feats = np.vstack([
+        np.tile(base, (5, 1)),
+        np.array([[1e8, 10.0, 0.0, 0.0], [1e8, 0.0, 10.0, 0.0]], dtype=np.float64),
+    ])
+    out_large = coreset_subsample(feats, ratio=4 / len(feats), mode="greedy_kcenter", seed=0)
+    assert out_large.shape == (4, 4)
+    assert len(set(chosen_indices)) == 3
+    assert any(np.allclose(row, [1e8, 10.0, 0.0, 0.0]) for row in out_large)
+    assert any(np.allclose(row, [1e8, 0.0, 10.0, 0.0]) for row in out_large)
+
+
+def test_coreset_greedy_kcenter_4shot_cpu_speed():
+    rng = np.random.default_rng(0)
+    feats = rng.normal(size=(4096, 384)).astype(np.float32)
+    t0 = time.perf_counter()
+    out = coreset_subsample(feats, ratio=0.5, mode="greedy_kcenter", seed=0)
+    elapsed = time.perf_counter() - t0
+    assert out.shape == (2048, 384)
+    assert elapsed < 5.0, f"4-shot coreset took {elapsed:.2f}s (expected < 5.0s)"

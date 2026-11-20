@@ -136,3 +136,43 @@ def test_run_anomaly_detection_fastref_without_cuda_sync_monkeypatch(toy_dataset
         plots_dir=str(tmp_path), faiss_on_cpu=True, use_fastref=True,
     )
     assert len(scores) == 6
+
+
+@pytest.mark.parametrize("use_fastref", [True, False])
+@pytest.mark.parametrize("model_device", [None, "cpu"])
+def test_run_anomaly_detection_skips_cuda_sync_on_cpu_when_cuda_available(
+    toy_dataset, dummy_model, tmp_path, monkeypatch, use_fastref, model_device
+):
+    if model_device is not None:
+        dummy_model.device = model_device
+
+    def fail_sync():
+        raise AssertionError("CUDA synchronize should not be called when running on CPU")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", fail_sync)
+    scores, _, _ = run_anomaly_detection(
+        dummy_model, "toy", str(toy_dataset), n_ref_samples=1, object_anomalies={"toy": ["bad"]},
+        plots_dir=str(tmp_path), faiss_on_cpu=True, use_fastref=use_fastref,
+    )
+    assert len(scores) == 6
+
+
+def test_run_anomaly_detection_calls_cuda_sync_when_model_on_cuda(
+    toy_dataset, dummy_model, tmp_path, monkeypatch
+):
+    dummy_model.device = "cuda"
+    sync_calls = 0
+
+    def record_sync():
+        nonlocal sync_calls
+        sync_calls += 1
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", record_sync)
+    scores, _, _ = run_anomaly_detection(
+        dummy_model, "toy", str(toy_dataset), n_ref_samples=1, object_anomalies={"toy": ["bad"]},
+        plots_dir=str(tmp_path), faiss_on_cpu=True, use_fastref=True,
+    )
+    assert len(scores) == 6
+    assert sync_calls == 6

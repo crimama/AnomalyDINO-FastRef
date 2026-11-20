@@ -114,6 +114,7 @@ def run_anomaly_detection(
         
         features_ref = np.concatenate(features_ref, axis=0).astype('float32')
 
+        fastref_device = "cpu"
         if use_fastref:
             cfg = (
                 fastref_config
@@ -141,6 +142,12 @@ def run_anomaly_detection(
             if knn_metric == "L2_normalized":
                 faiss.normalize_L2(features_ref)
             knn_index.add(features_ref)
+
+        uses_cuda = torch.cuda.is_available() and (
+            str(getattr(model, "device", "") or "").startswith("cuda")
+            or (use_fastref and str(fastref_device).startswith("cuda"))
+            or (not use_fastref and not faiss_on_cpu)
+        )
 
         # end measuring time (for memory bank set up; in seconds, same for all test samples of this object)
         time_memorybank = time.time() - start_time
@@ -207,7 +214,7 @@ def run_anomaly_detection(
                 d_masked = output_distances.reshape(grid_size2)
                 
                 # save inference time
-                if torch.cuda.is_available():
+                if uses_cuda:
                     torch.cuda.synchronize() # Synchronize CUDA kernels before measuring time
                 inf_time = time.time() - start_time
                 inference_times[f"{type_anomaly}/{img_test_nr}"] = inf_time

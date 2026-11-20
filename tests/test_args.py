@@ -1,3 +1,4 @@
+import subprocess
 import sys
 
 import pytest
@@ -133,3 +134,50 @@ def test_resolve_device():
     assert run_anomalydino.resolve_device("cpu") == "cpu"
     assert run_anomalydino.resolve_device("cuda:0") == "cuda"
     assert run_anomalydino.resolve_device("cuda") == "cuda"
+
+
+@pytest.mark.parametrize("argv", [
+    ["--use_fastref", "--fastref_alpha", "2.0"],
+    ["--use_fastref", "--fastref_lambda", "nan"],
+    ["--use_fastref", "--fastref_lambda", "inf"],
+    ["--use_fastref", "--fastref_ot_eps", "nan"],
+    ["--use_fastref", "--fastref_ot_eps", "0.0"],
+    ["--use_fastref", "--fastref_ridge", "-0.1"],
+    ["--use_fastref", "--fastref_iters", "-1"],
+    ["--use_fastref", "--fastref_ot_iters", "0"],
+])
+def test_validate_args_rejects_invalid_fastref_values(monkeypatch, argv):
+    args = parse(run_anomalydino, monkeypatch, *argv)
+    with pytest.raises(ValueError):
+        run_anomalydino.validate_args(args)
+
+
+@pytest.mark.parametrize("argv", [
+    ["--use_fastref"],
+    [],
+    ["--fastref_alpha", "2.0", "--fastref_lambda", "nan"],
+])
+def test_validate_args_passes_when_valid_or_fastref_disabled(monkeypatch, argv):
+    args = parse(run_anomalydino, monkeypatch, *argv)
+    run_anomalydino.validate_args(args)
+
+
+def test_cli_main_validates_fastref_before_model_load_or_dirs(tmp_path):
+    proc = subprocess.run(
+        [
+            sys.executable,
+            run_anomalydino.__file__,
+            "--use_fastref",
+            "--fastref_alpha",
+            "2.0",
+            "--data_root",
+            str(tmp_path / "missing_data"),
+        ],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "ValueError" in proc.stderr
+    assert "alpha" in proc.stderr
+    assert list(tmp_path.iterdir()) == []

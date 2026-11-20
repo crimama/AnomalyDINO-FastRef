@@ -104,6 +104,12 @@ def build_fastref_config(args, seed: int = 0) -> FastRefConfig:
     )
 
 
+def validate_args(args) -> None:
+    """Validate CLI arguments before model loading or output directory creation."""
+    if args.use_fastref:
+        build_fastref_config(args, seed=0)
+
+
 def build_results_dir(args, shot: int) -> str:
     """Build output directory path, isolating FastRef runs with a '_fastref' suffix."""
     model_dir = f"{args.model_name}_{args.resolution}" + (
@@ -120,6 +126,7 @@ def build_results_dir(args, shot: int) -> str:
 if __name__=="__main__":
 
     args = parse_args()
+    validate_args(args)
     limit_cpu_threads(args.num_threads)
     
     print(f"Requested to run {len(args.shots)} (different) shot(s):", args.shots)

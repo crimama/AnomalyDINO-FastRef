@@ -1,3 +1,4 @@
+import contextlib
 from dataclasses import dataclass
 import math
 
@@ -27,18 +28,18 @@ class FastRefConfig:
     seed: int = 0
 
     def __post_init__(self) -> None:
-        if not (0.0 < self.alpha <= 1.0):
+        if not (math.isfinite(self.alpha) and 0.0 < self.alpha <= 1.0):
             raise ValueError(f"alpha must be in (0, 1], got {self.alpha}")
-        if self.lam < 0.0:
-            raise ValueError(f"lam must be >= 0, got {self.lam}")
+        if not (math.isfinite(self.lam) and self.lam >= 0.0):
+            raise ValueError(f"lam must be finite and >= 0, got {self.lam}")
         if self.num_iters < 0:
             raise ValueError(f"num_iters must be >= 0, got {self.num_iters}")
         if self.sinkhorn_iters < 1:
             raise ValueError(f"sinkhorn_iters must be >= 1, got {self.sinkhorn_iters}")
-        if self.sinkhorn_eps <= 0.0:
-            raise ValueError(f"sinkhorn_eps must be > 0, got {self.sinkhorn_eps}")
-        if self.ridge < 0.0:
-            raise ValueError(f"ridge must be >= 0, got {self.ridge}")
+        if not (math.isfinite(self.sinkhorn_eps) and self.sinkhorn_eps > 0.0):
+            raise ValueError(f"sinkhorn_eps must be finite and > 0, got {self.sinkhorn_eps}")
+        if not (math.isfinite(self.ridge) and self.ridge >= 0.0):
+            raise ValueError(f"ridge must be finite and >= 0, got {self.ridge}")
         if self.metric not in _VALID_METRICS:
             raise ValueError(f"metric must be one of {sorted(_VALID_METRICS)}, got {self.metric!r}")
         if self.score_mode not in _VALID_SCORE_MODES:
@@ -53,6 +54,30 @@ class FastRefConfig:
             raise ValueError(
                 f"coreset_mode must be one of {sorted(_VALID_CORESET_MODES)}, got {self.coreset_mode!r}"
             )
+
+
+@contextlib.contextmanager
+def _blas_thread_cap(max_threads: int = 4):
+    """Cap BLAS threads inside tight dgemv loops to avoid multi-core barrier thrashing."""
+    try:
+        from threadpoolctl import ThreadpoolController
+    except ImportError:
+        yield
+        return
+
+    controller = ThreadpoolController()
+    thread_counts = [
+        lib["num_threads"]
+        for lib in controller.info()
+        if lib.get("user_api") == "blas" and lib.get("num_threads")
+    ]
+    if not thread_counts or max(thread_counts) <= max_threads:
+        yield
+        return
+
+    cap = min(max_threads, min(thread_counts))
+    with controller.limit(limits=cap, user_api="blas"):
+        yield
 
 
 def coreset_subsample(
@@ -82,24 +107,26 @@ def coreset_subsample(
         indices = rng.choice(n_total, size=n_select, replace=False)
         return features[indices].copy()
 
-    work = features.astype(np.float64, copy=False)
+    work = np.ascontiguousarray(features, dtype=np.float64)
     if mode == "approx_kcenter" and dim > proj_dim:
         proj = rng.normal(loc=0.0, scale=1.0 / math.sqrt(proj_dim), size=(dim, proj_dim))
         work = work @ proj
 
     start = int(rng.integers(0, n_total))
     selected = [start]
-    min_sq_dists = np.sum((work - work[start]) ** 2, axis=1)
-    min_sq_dists[start] = -1.0  # Sentinel prevents re-selecting chosen indices on duplicate points.
+    work_norm_sq = np.einsum("ij,ij->i", work, work)
+    with _blas_thread_cap(max_threads=4):
+        min_sq_dists = np.maximum(0.0, work_norm_sq + work_norm_sq[start] - 2.0 * (work @ work[start]))
+        min_sq_dists[start] = -1.0  # Sentinel prevents re-selecting chosen indices on duplicate points.
 
-    for _ in range(1, n_select):
-        idx = int(np.argmax(min_sq_dists))
-        selected.append(idx)
-        sq_dists = np.sum((work - work[idx]) ** 2, axis=1)
-        min_sq_dists = np.minimum(min_sq_dists, sq_dists)
-        min_sq_dists[idx] = -1.0
+        for _ in range(1, n_select):
+            idx = int(np.argmax(min_sq_dists))
+            selected.append(idx)
+            sq_dists = np.maximum(0.0, work_norm_sq + work_norm_sq[idx] - 2.0 * (work @ work[idx]))
+            np.minimum(min_sq_dists, sq_dists, out=min_sq_dists)
+            min_sq_dists[idx] = -1.0
 
-    return features[selected].copy()
+    return features[selected]
 
 
 def sinkhorn_transport(
@@ -110,8 +137,8 @@ def sinkhorn_transport(
     """Compute entropic-regularized optimal transport plan in log domain with uniform marginals."""
     if cost_matrix.ndim != 2 or cost_matrix.shape[0] == 0 or cost_matrix.shape[1] == 0:
         raise ValueError(f"cost_matrix must be a non-empty 2D tensor, got shape {tuple(cost_matrix.shape)}")
-    if eps <= 0.0:
-        raise ValueError(f"eps must be > 0, got {eps}")
+    if not (math.isfinite(eps) and eps > 0.0):
+        raise ValueError(f"eps must be finite and > 0, got {eps}")
     if num_iters < 1:
         raise ValueError(f"num_iters must be >= 1, got {num_iters}")
 
