@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from src.detection import run_anomaly_detection
+from src.fastref import FastRefConfig
 from src.post_eval import eval_classification, parse_dataset_files
 
 
@@ -80,3 +81,58 @@ def test_custom_dataset_end_to_end(toy_dataset, dummy_model, tmp_path):
 
     with pytest.raises(FileNotFoundError, match="ground truth masks"):
         eval_segmentation(gt, pred)
+
+
+@pytest.mark.parametrize("knn_metric", ["L2", "L2_normalized"])
+@pytest.mark.parametrize("score_mode", ["reconstruction", "nn"])
+def test_run_anomaly_detection_with_fastref(toy_dataset, dummy_model, tmp_path, knn_metric, score_mode):
+    object_anomalies = {"toy": ["bad"]}
+    cfg = FastRefConfig(
+        alpha=0.5, lam=0.1, num_iters=2, sinkhorn_iters=10,
+        metric="cosine" if knn_metric == "L2_normalized" else "euclidean",
+        score_mode=score_mode,
+    )
+    scores, time_memorybank, inference_times = run_anomaly_detection(
+        dummy_model, "toy", str(toy_dataset), n_ref_samples=1, object_anomalies=object_anomalies,
+        plots_dir=str(tmp_path), rotation=False, knn_metric=knn_metric, faiss_on_cpu=True,
+        use_fastref=True, fastref_config=cfg,
+    )
+    assert set(scores) == set(inference_times) == {f"{t}/{i:03d}.png" for t in ["bad", "good"] for i in range(3)}
+    assert time_memorybank >= 0
+    good = [scores[f"good/{i:03d}.png"] for i in range(3)]
+    bad = [scores[f"bad/{i:03d}.png"] for i in range(3)]
+    assert min(bad) > max(good)
+
+    anomaly_maps = tmp_path / "anomaly_maps" / "seed=0"
+    assert np.load(anomaly_maps / "toy" / "test" / "bad" / "000.npy").shape == (8, 10)
+    gt, pred = parse_dataset_files("toy", str(toy_dataset), str(anomaly_maps), dataset="MVTec")
+    auroc, _, _ = eval_classification(gt, pred)
+    assert auroc == pytest.approx(1.0)
+
+
+def test_run_anomaly_detection_fastref_default_config_and_empty_mask(toy_dataset, dummy_model, tmp_path, monkeypatch):
+    # Empty foreground mask on test images must not crash and returns zero scores
+    monkeypatch.setattr(
+        dummy_model,
+        "compute_background_mask",
+        lambda feats, grid_size, threshold=10, masking_type=False: np.zeros(feats.shape[0], dtype=bool)
+        if masking_type else np.ones(feats.shape[0], dtype=bool),
+    )
+    scores, _, _ = run_anomaly_detection(
+        dummy_model, "toy", str(toy_dataset), n_ref_samples=1, object_anomalies={"toy": ["bad"]},
+        plots_dir=str(tmp_path), masking=True, faiss_on_cpu=True, use_fastref=True,
+    )
+    assert all(v == 0.0 for v in scores.values())
+
+
+def test_run_anomaly_detection_fastref_without_cuda_sync_monkeypatch(toy_dataset, dummy_model, tmp_path, monkeypatch):
+    # Even if torch.cuda.synchronize raises when CUDA is unavailable, CPU FastRef must succeed
+    def fail_sync():
+        raise AssertionError("CUDA synchronize should not be called on CPU when CUDA is unavailable")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "synchronize", fail_sync)
+    scores, _, _ = run_anomaly_detection(
+        dummy_model, "toy", str(toy_dataset), n_ref_samples=1, object_anomalies={"toy": ["bad"]},
+        plots_dir=str(tmp_path), faiss_on_cpu=True, use_fastref=True,
+    )
+    assert len(scores) == 6

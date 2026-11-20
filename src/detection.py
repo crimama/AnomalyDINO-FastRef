@@ -10,6 +10,7 @@ import torch
 
 from src.utils import augment_image, dists2map, plot_ref_images, list_images
 from src.post_eval import mean_top1p
+from src.fastref import FastRefConfig, FastRefRefiner
 
 def run_anomaly_detection(
         model,
@@ -27,7 +28,9 @@ def run_anomaly_detection(
         faiss_on_cpu = False,
         seed = 0,
         save_patch_dists = True,
-        save_tiffs = False):
+        save_tiffs = False,
+        use_fastref = False,
+        fastref_config = None):
     """
     Main function to evaluate the anomaly detection performance of a given object/product.
 
@@ -46,6 +49,8 @@ def run_anomaly_detection(
     - seed: The seed value for deterministic sampling in few-shot setting. Default is 0.
     - save_patch_dists: Whether to save the patch distances. Default is True. Required to eval detection.
     - save_tiffs: Whether to save the anomaly maps as TIFF files. Default is False. Required to eval segmentation.
+    - use_fastref: Whether to use FastRef prototype refinement instead of FAISS kNN search. Default is False.
+    - fastref_config: Optional FastRefConfig override when use_fastref is True.
     """
 
     assert knn_metric in ["L2", "L2_normalized"]
@@ -109,17 +114,33 @@ def run_anomaly_detection(
         
         features_ref = np.concatenate(features_ref, axis=0).astype('float32')
 
-        if faiss_on_cpu:
-            # similarity search on CPU
-            knn_index = faiss.IndexFlatL2(features_ref.shape[1])
+        if use_fastref:
+            cfg = (
+                fastref_config
+                if fastref_config is not None
+                else FastRefConfig(
+                    metric="cosine" if knn_metric == "L2_normalized" else "euclidean",
+                    seed=seed,
+                )
+            )
+            fastref_device = (
+                "cpu"
+                if (faiss_on_cpu or not torch.cuda.is_available())
+                else (getattr(model, "device", None) or "cpu")
+            )
+            fastref_refiner = FastRefRefiner(cfg, device=fastref_device).fit(features_ref)
         else:
-            # similarity search on GPU
-            res = faiss.StandardGpuResources()
-            knn_index = faiss.GpuIndexFlatL2(res, features_ref.shape[1])
+            if faiss_on_cpu:
+                # similarity search on CPU
+                knn_index = faiss.IndexFlatL2(features_ref.shape[1])
+            else:
+                # similarity search on GPU
+                res = faiss.StandardGpuResources()
+                knn_index = faiss.GpuIndexFlatL2(res, features_ref.shape[1])
 
-        if knn_metric == "L2_normalized":
-            faiss.normalize_L2(features_ref)
-        knn_index.add(features_ref)
+            if knn_metric == "L2_normalized":
+                faiss.normalize_L2(features_ref)
+            knn_index.add(features_ref)
 
         # end measuring time (for memory bank set up; in seconds, same for all test samples of this object)
         time_memorybank = time.time() - start_time
@@ -162,26 +183,32 @@ def run_anomaly_detection(
                 # Discard irrelevant features
                 features2 = features2[mask2]
 
-                # Compute distances to nearest neighbors in M
-                if knn_metric == "L2":
-                    distances, match2to1 = knn_index.search(features2, k = knn_neighbors)
-                    if knn_neighbors > 1:
-                        distances = distances.mean(axis=1)
-                    distances = np.sqrt(distances)
+                if use_fastref:
+                    distances = fastref_refiner.score(features2)
+                else:
+                    # Compute distances to nearest neighbors in M
+                    if knn_metric == "L2":
+                        distances, match2to1 = knn_index.search(features2, k = knn_neighbors)
+                        if knn_neighbors > 1:
+                            distances = distances.mean(axis=1)
+                        distances = np.sqrt(distances)
 
-                elif knn_metric == "L2_normalized":
-                    faiss.normalize_L2(features2) 
-                    distances, match2to1 = knn_index.search(features2, k = knn_neighbors)
-                    if knn_neighbors > 1:
-                        distances = distances.mean(axis=1)
-                    distances = distances / 2   # equivalent to cosine distance (1 - cosine similarity)
+                    elif knn_metric == "L2_normalized":
+                        faiss.normalize_L2(features2) 
+                        distances, match2to1 = knn_index.search(features2, k = knn_neighbors)
+                        if knn_neighbors > 1:
+                            distances = distances.mean(axis=1)
+                        distances = distances / 2   # equivalent to cosine distance (1 - cosine similarity)
+
+                    distances = distances.squeeze()
 
                 output_distances = np.zeros_like(mask2, dtype=float)
-                output_distances[mask2] = distances.squeeze()
+                output_distances[mask2] = distances
                 d_masked = output_distances.reshape(grid_size2)
                 
                 # save inference time
-                torch.cuda.synchronize() # Synchronize CUDA kernels before measuring time
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize() # Synchronize CUDA kernels before measuring time
                 inf_time = time.time() - start_time
                 inference_times[f"{type_anomaly}/{img_test_nr}"] = inf_time
                 anomaly_score = mean_top1p(output_distances.flatten())
