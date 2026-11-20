@@ -1,0 +1,34 @@
+# Usage:
+#   DATA_DIR=/path/to/datasets docker compose up -d --build
+#   docker compose exec anomalydino python run_anomalydino.py --data_root /data/MVTecAD ...
+services:
+  anomalydino:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    image: anomalydino:local
+    container_name: anomalydino
+    ipc: host
+    stdin_open: true
+    tty: true
+    working_dir: /workspace/AnomalyDINO
+    environment:
+      - MPLBACKEND=Agg
+      - TORCH_HOME=/workspace/.cache/torch
+      - HF_HOME=/workspace/.cache/huggingface
+      - MPLCONFIGDIR=/workspace/.cache/matplotlib
+    volumes:
+      - .:/workspace/AnomalyDINO
+      - ./.cache:/workspace/.cache
+      - ${DATA_DIR:-./data}:/data:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: ["sleep", "infinity"]

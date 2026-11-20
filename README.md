@@ -42,6 +42,14 @@ For custom datasets (any `--dataset` name other than MVTec/VisA), test images ca
 
 ## Usage
 
+### Docker
+A GPU-enabled container (requires the NVIDIA Container Toolkit) is provided. Mount your dataset directory via `DATA_DIR`; it appears at `/data` inside the container.
+```shell
+DATA_DIR=/path/to/datasets docker compose up -d --build
+docker compose exec anomalydino pytest tests
+docker compose exec anomalydino python run_anomalydino.py --dataset MVTec --data_root /data/mvtec_anomaly_detection --shots 1 --num_seeds 1
+```
+
 ### Short Demo
 Get started with the minimal demo to perform few-shot anomaly detection (`demo_AnomalyDINO.ipynb`).
 
